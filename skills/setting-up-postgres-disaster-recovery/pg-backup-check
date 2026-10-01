@@ -1,0 +1,268 @@
+#!/usr/bin/python3
+"""Postgres backup health check -> Slack. Runs as the postgres OS user on the database host.
+
+  pg-backup-check check             hourly: posts only when something is wrong (repeats every REPEAT_AFTER_H
+                                    while it stays wrong, and once more when it recovers)
+  pg-backup-check daily             posts a summary either way - a heartbeat, so silence never means "fine"
+  pg-backup-check unit-failed UNIT  systemd OnFailure= hook for the backup / dump / check units
+  --dry-run                         print instead of posting (and don't touch the alert state)
+
+Configuration comes from the environment (systemd: EnvironmentFile=/etc/default/pg-backup-check for settings,
+EnvironmentFile=/etc/pg-backup-alert.env, root-only, for the webhook):
+
+  SLACK_WEBHOOK_URL            required to post (not needed with --dry-run)
+  PG_BACKUP_PGDATA             required, data directory (for the WAL .ready backlog), e.g. /pgdata/18/main
+  PG_BACKUP_STANZA             pgBackRest stanza (default: main)
+  PG_BACKUP_DUMP_URL           gs:// prefix holding <date>/<db>.dump folders; unset = skip the logical-dump check
+  PG_BACKUP_MAIN_DB            database whose dump must be at least PG_BACKUP_MAIN_DB_MIN_BYTES (catches empty dumps)
+  PG_BACKUP_MAIN_DB_MIN_BYTES  default 1000000; set to roughly a fifth of today's dump size
+  PG_BACKUP_UNITS              space-separated units whose last run must not have failed
+                               (default: pgbackrest@full.service pgbackrest@diff.service pg-logical-dump.service)
+  PG_BACKUP_DISKS              space-separated mount points to watch (default: the data dir's mount and /)
+  PG_BACKUP_MAX_BACKUP_AGE_H, PG_BACKUP_MAX_DUMP_AGE_H (26), PG_BACKUP_MAX_READY_AGE_MIN (15),
+  PG_BACKUP_MAX_DISK_PCT (80), PG_BACKUP_REPEAT_AFTER_H (6)   thresholds
+
+The dump check lists objects with `gcloud storage`; for S3 or Azure, adapt list_dump_folder() / stat_object().
+"""
+import glob
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime
+
+ENV = os.environ
+STANZA = ENV.get("PG_BACKUP_STANZA", "main")
+PGDATA = ENV.get("PG_BACKUP_PGDATA", "")
+DUMP_URL = ENV.get("PG_BACKUP_DUMP_URL", "").rstrip("/")
+MAIN_DB = ENV.get("PG_BACKUP_MAIN_DB", "")
+MAIN_DB_MIN_BYTES = int(ENV.get("PG_BACKUP_MAIN_DB_MIN_BYTES", 1_000_000))
+UNITS = ENV.get("PG_BACKUP_UNITS", "pgbackrest@full.service pgbackrest@diff.service pg-logical-dump.service").split()
+MAX_BACKUP_AGE_H = float(ENV.get("PG_BACKUP_MAX_BACKUP_AGE_H", 26))  # diff daily, full weekly
+MAX_DUMP_AGE_H = float(ENV.get("PG_BACKUP_MAX_DUMP_AGE_H", 26))
+MAX_READY_AGE_MIN = float(ENV.get("PG_BACKUP_MAX_READY_AGE_MIN", 15))  # oldest WAL segment waiting to be archived
+MAX_DISK_PCT = float(ENV.get("PG_BACKUP_MAX_DISK_PCT", 80))
+REPEAT_AFTER_H = float(ENV.get("PG_BACKUP_REPEAT_AFTER_H", 6))
+STATE = os.path.expanduser("~/.pg-backup-check.json")
+HOST = socket.gethostname()
+
+
+def sh(*cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if r.returncode:
+        raise RuntimeError(f"{cmd[0]} exited {r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}")
+    return r.stdout
+
+
+def ago(seconds):
+    return f"{seconds / 60:.0f} min ago" if seconds < 7200 else f"{seconds / 3600:.1f} h ago"
+
+
+def mb(n):
+    return f"{n / 1e6:.0f} MB"
+
+
+def check_pgbackrest(now, problems, info):
+    try:
+        stanza = next(s for s in json.loads(sh("pgbackrest", "--output=json", "info")) if s["name"] == STANZA)
+    except Exception as e:
+        problems["pgbackrest"] = f"cannot read pgBackRest info for stanza {STANZA}: {e}"
+        return
+    if stanza["status"]["code"] != 0:
+        problems["pgbackrest-status"] = f"pgBackRest stanza status: {stanza['status']['message']}"
+    backups = stanza.get("backup") or []
+    if not backups:
+        problems["pgbackrest-none"] = "pgBackRest has no backups"
+        return
+    last = backups[-1]
+    age = now - last["timestamp"]["stop"]
+    fulls = sum(b["type"] == "full" for b in backups)
+    info.append(f"last pgBackRest backup: {last['type']} `{last['label']}`, {ago(age)} "
+                f"({mb(last['info']['repository']['delta'])} stored); {fulls} full backup(s) kept")
+    if age > MAX_BACKUP_AGE_H * 3600:
+        problems["pgbackrest-stale"] = f"newest pgBackRest backup is {ago(age)} (limit {MAX_BACKUP_AGE_H:g} h)"
+
+
+def check_archiving(now, problems, info):
+    try:
+        row = sh("psql", "-XAt", "-F", "|", "-c",
+                 "select archived_count, failed_count,"
+                 " coalesce(extract(epoch from now() - last_archived_time)::int, -1),"
+                 " coalesce(last_failed_time > coalesce(last_archived_time, 'epoch'), false),"
+                 " coalesce(last_failed_wal, '') from pg_stat_archiver").strip().split("|")
+    except Exception as e:
+        problems["postgres"] = f"cannot query Postgres: {e}"
+        return
+    archived, failed, last_age, failing, failed_wal = int(row[0]), int(row[1]), int(row[2]), row[3] == "t", row[4]
+    # The backlog of .ready files is the real signal: "nothing archived for N minutes" false-alarms on an idle database.
+    ages = []
+    for p in glob.glob(f"{PGDATA}/pg_wal/archive_status/*.ready"):
+        try:
+            ages.append(now - os.path.getmtime(p))
+        except FileNotFoundError:  # archived between glob and stat
+            pass
+    last = ago(last_age) if last_age >= 0 else "never"
+    info.append(f"WAL archiving: {archived} archived / {failed} failed since stats reset, last {last}, "
+                f"{len(ages)} waiting")
+    if failing:
+        problems["wal-failing"] = (f"WAL archiving is FAILING (last failed segment {failed_wal}); "
+                                   f"pg_wal keeps growing until the disk fills")
+    if ages and max(ages) > MAX_READY_AGE_MIN * 60:
+        problems["wal-backlog"] = f"{len(ages)} WAL segment(s) waiting to be archived, oldest {ago(max(ages))}"
+
+
+def list_dump_folder(prefix):
+    """Names of the entries directly under prefix (folders end with '/')."""
+    return [u[len(prefix):] for u in sh("gcloud", "storage", "ls", prefix).split() if u.startswith(prefix)]
+
+
+def stat_object(url):
+    """(size in bytes, last-modified epoch) of one object."""
+    size, stamp, _ = sh("gcloud", "storage", "ls", "-l", url).split("\n")[0].split()
+    return int(size), datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+
+
+def check_dumps(now, problems, info):
+    if not DUMP_URL:
+        return
+    try:
+        days = sorted(n.rstrip("/") for n in list_dump_folder(DUMP_URL + "/") if n.endswith("/"))
+        if not days:
+            problems["dump-none"] = f"no logical dumps under {DUMP_URL}"
+            return
+        folder = f"{DUMP_URL}/{days[-1]}/"
+        names = set(list_dump_folder(folder))
+        dbs = sh("psql", "-XAtc", "select datname from pg_database where not datistemplate"
+                                  " and datname <> 'postgres'").split()
+        main = MAIN_DB or (sorted(dbs)[0] if dbs else "")
+        size, stamp = stat_object(folder + f"{main}.dump")
+    except Exception as e:
+        problems["dump"] = f"cannot verify logical dumps: {e}"
+        return
+    age = now - stamp
+    info.append(f"logical dump {days[-1]}: {len(names)} files, {main}.dump {mb(size)}, {ago(age)}")
+    if age > MAX_DUMP_AGE_H * 3600:
+        problems["dump-stale"] = f"newest logical dump is {ago(age)} (limit {MAX_DUMP_AGE_H:g} h)"
+    if MAIN_DB and size < MAIN_DB_MIN_BYTES:
+        problems["dump-small"] = f"{main}.dump is only {mb(size)} (expected > {mb(MAIN_DB_MIN_BYTES)})"
+    missing = sorted(f"{db}.dump" for db in dbs if f"{db}.dump" not in names)
+    if missing:
+        problems["dump-missing"] = f"logical dump {days[-1]} is missing {', '.join(missing)}"
+
+
+def check_units(problems):
+    for unit in UNITS:
+        state = subprocess.run(["systemctl", "is-failed", unit], capture_output=True, text=True).stdout.strip()
+        if state == "failed":
+            problems[f"unit-{unit}"] = f"`{unit}` last run FAILED (`journalctl -u {unit}`)"
+
+
+def mount_of(path):
+    path = os.path.realpath(path)
+    while not os.path.ismount(path):
+        path = os.path.dirname(path)
+    return path
+
+
+def check_disks(problems, info):
+    disks = ENV.get("PG_BACKUP_DISKS", "").split() or sorted({mount_of(PGDATA), "/"})
+    parts = []
+    for path in disks:
+        st = os.statvfs(path)
+        pct = 100 * (1 - st.f_bavail / st.f_blocks)
+        parts.append(f"{path} {pct:.0f}%")
+        if pct > MAX_DISK_PCT:
+            problems[f"disk-{path}"] = f"{path} is {pct:.0f}% full (limit {MAX_DISK_PCT:g}%)"
+    info.append("disk used: " + ", ".join(parts))
+
+
+def gather():
+    now = time.time()
+    problems, info = {}, []
+    check_pgbackrest(now, problems, info)
+    check_archiving(now, problems, info)
+    check_dumps(now, problems, info)
+    check_units(problems)
+    check_disks(problems, info)
+    return problems, info
+
+
+def bullets(lines):
+    return "\n".join(f"• {line}" for line in lines)
+
+
+def alert_text(problems, info):
+    return (f":rotating_light: *Postgres backups need attention on {HOST}*\n{bullets(problems.values())}\n"
+            f"_current state:_\n{bullets(info)}")
+
+
+def post(text, dry):
+    if dry:
+        print(text)
+        return
+    url = ENV.get("SLACK_WEBHOOK_URL")
+    if not url:
+        sys.exit("SLACK_WEBHOOK_URL is not set")
+    req = urllib.request.Request(url, data=json.dumps({"text": text}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        body = r.read().decode().strip()
+    if body != "ok":
+        sys.exit(f"Slack answered {body!r}")
+    print("posted to Slack:", text.split("\n")[0])
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state, dry):
+    if not dry:
+        with open(STATE, "w") as f:
+            json.dump(state, f)
+
+
+def main(argv):
+    dry = "--dry-run" in argv
+    args = [a for a in argv if a != "--dry-run"]
+    mode = args[0] if args else "check"
+
+    if mode == "unit-failed":
+        unit = args[1] if len(args) > 1 else "unknown"
+        unit = unit if "." in unit else unit + ".service"
+        log = subprocess.run(["journalctl", "-u", unit, "-n", "12", "--no-pager", "-o", "cat"],
+                             capture_output=True, text=True).stdout.strip()
+        post(f":rotating_light: *`{unit}` failed on {HOST}*\n```{log[-2500:] or '(no journal access)'}```", dry)
+        return
+
+    if not PGDATA:
+        sys.exit("PG_BACKUP_PGDATA is not set")
+    problems, info = gather()
+    state = load_state()
+    keys = sorted(problems)
+    if mode == "daily":
+        post(alert_text(problems, info) if problems else
+             f":white_check_mark: *Postgres backups healthy on {HOST}* (daily check)\n{bullets(info)}", dry)
+        save_state({"keys": keys, "posted": time.time()} if problems else {}, dry)
+    elif problems:
+        if keys != state.get("keys") or time.time() - state.get("posted", 0) > REPEAT_AFTER_H * 3600:
+            post(alert_text(problems, info), dry)
+            save_state({"keys": keys, "posted": time.time()}, dry)
+        else:
+            print("still failing, alerted already:", "; ".join(problems.values()))
+    else:
+        if state.get("keys"):
+            post(f":white_check_mark: *Postgres backups on {HOST} recovered*\n{bullets(info)}", dry)
+        save_state({}, dry)
+        print("ok:", "; ".join(info))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

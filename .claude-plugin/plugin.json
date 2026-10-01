@@ -1,0 +1,20 @@
+{
+  "name": "postgres-dr",
+  "description": "Skills for recovering lost PostgreSQL data and setting up tested backups and disaster recovery (pgBackRest PITR, logical dumps, snapshots, restore drills, alerting) on self-hosted Postgres",
+  "version": "0.1.0",
+  "author": {
+    "name": "Shivam Srivastava"
+  },
+  "keywords": [
+    "postgres",
+    "backup",
+    "disaster-recovery",
+    "pitr",
+    "pgbackrest",
+    "incident-response",
+    "restore"
+  ],
+  "homepage": "https://github.com/shivamsriva31093/postgres-dr-skills",
+  "repository": "https://github.com/shivamsriva31093/postgres-dr-skills",
+  "license": "MIT"
+}

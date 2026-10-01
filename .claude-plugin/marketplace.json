@@ -1,0 +1,15 @@
+{
+  "name": "postgres-dr",
+  "description": "PostgreSQL data recovery and backup/DR skills",
+  "owner": {
+    "name": "Shivam Srivastava"
+  },
+  "plugins": [
+    {
+      "name": "postgres-dr",
+      "source": "./",
+      "description": "Skills for recovering lost PostgreSQL data and setting up tested backups and disaster recovery on self-hosted Postgres",
+      "version": "0.1.0"
+    }
+  ]
+}
